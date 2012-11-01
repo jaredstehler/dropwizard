@@ -2,13 +2,9 @@ package com.yammer.dropwizard.config;
 
 import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.yammer.dropwizard.jetty.BiDiGzipHandler;
-import com.yammer.dropwizard.jetty.InstrumentedSslSelectChannelConnector;
-import com.yammer.dropwizard.jetty.InstrumentedSslSocketConnector;
 import com.yammer.dropwizard.jetty.UnbrandedErrorHandler;
-import com.yammer.dropwizard.logging.Log;
 import com.yammer.dropwizard.servlets.ThreadNameFilter;
 import com.yammer.dropwizard.tasks.TaskServlet;
 import com.yammer.dropwizard.util.Duration;
@@ -16,7 +12,7 @@ import com.yammer.dropwizard.util.Size;
 import com.yammer.metrics.HealthChecks;
 import com.yammer.metrics.core.HealthCheck;
 import com.yammer.metrics.jetty.*;
-import com.yammer.metrics.reporting.AdminServlet;
+import com.yammer.metrics.servlet.AdminServlet;
 import com.yammer.metrics.util.DeadlockHealthCheck;
 import org.eclipse.jetty.security.ConstraintMapping;
 import org.eclipse.jetty.security.ConstraintSecurityHandler;
@@ -41,8 +37,11 @@ import org.eclipse.jetty.util.security.Credential;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.eclipse.jetty.util.thread.ThreadPool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.servlet.DispatcherType;
+import java.security.KeyStore;
 import java.util.EnumSet;
 import java.util.EventListener;
 import java.util.Map;
@@ -51,7 +50,7 @@ import java.util.Map;
 // TODO: 11/7/11 <coda> -- document ServerFactory
 
 public class ServerFactory {
-    private static final Log LOG = Log.forClass(ServerFactory.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(ServerFactory.class);
 
     private final HttpConfiguration config;
     private final RequestLogHandlerFactory requestLogHandlerFactory;
@@ -63,13 +62,13 @@ public class ServerFactory {
     }
 
     public Server buildServer(Environment env) throws ConfigurationException {
-        HealthChecks.register(new DeadlockHealthCheck());
+        HealthChecks.defaultRegistry().register(new DeadlockHealthCheck());
         for (HealthCheck healthCheck : env.getHealthChecks()) {
-            HealthChecks.register(healthCheck);
+            HealthChecks.defaultRegistry().register(healthCheck);
         }
 
         if (env.getHealthChecks().isEmpty()) {
-            LOG.warn('\n' +
+            LOGGER.warn('\n' +
                              "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n" +
                              "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n" +
                              "!    THIS SERVICE HAS NO HEALTHCHECKS. THIS MEANS YOU WILL NEVER KNOW IF IT    !\n" +
@@ -203,8 +202,24 @@ public class ServerFactory {
             factory.setKeyManagerPassword(password);
         }
 
+        for (String certAlias : config.getSslConfiguration().getCertAlias().asSet()) {
+            factory.setCertAlias(certAlias);
+        }
+
         for (String type : config.getSslConfiguration().getKeyStoreType().asSet()) {
-          factory.setKeyStoreType(type);
+            if (type.startsWith("Windows-")) {
+                try {
+                    final KeyStore keyStore = KeyStore.getInstance(type);
+
+                    keyStore.load(null, null);
+                    factory.setKeyStore(keyStore);
+
+                } catch (Exception e) {
+                    throw new IllegalStateException("Windows key store not supported", e);
+                }
+            } else {
+                factory.setKeyStoreType(type);
+            }
         }
 
         factory.setIncludeProtocols(config.getSslConfiguration().getSupportedProtocols());
@@ -215,7 +230,7 @@ public class ServerFactory {
         final HandlerCollection collection = new HandlerCollection();
 
         collection.addHandler(createInternalServlet(env));
-        collection.addHandler(createExternalServlet(env.getServlets(), env.getFilters(), env.getServletListeners()));
+        collection.addHandler(createExternalServlet(env));
 
         if (requestLogHandlerFactory.isEnabled()) {
             collection.addHandler(requestLogHandlerFactory.build());
@@ -268,29 +283,29 @@ public class ServerFactory {
 
     }
 
-    private Handler createExternalServlet(ImmutableMap<String, ServletHolder> servlets,
-                                          ImmutableMultimap<String, FilterHolder> filters,
-                                          ImmutableSet<EventListener> listeners) {
+    private Handler createExternalServlet(Environment env) {
         final ServletContextHandler handler = new ServletContextHandler();
         handler.addFilter(ThreadNameFilter.class, "/*", EnumSet.of(DispatcherType.REQUEST));
         handler.setBaseResource(Resource.newClassPathResource("."));
 
-        for (ImmutableMap.Entry<String, ServletHolder> entry : servlets.entrySet()) {
+        for (ImmutableMap.Entry<String, ServletHolder> entry : env.getServlets().entrySet()) {
             handler.addServlet(entry.getValue(), entry.getKey());
         }
 
-        for (ImmutableMap.Entry<String, FilterHolder> entry : filters.entries()) {
+        for (ImmutableMap.Entry<String, FilterHolder> entry : env.getFilters().entries()) {
             handler.addFilter(entry.getValue(), entry.getKey(), EnumSet.of(DispatcherType.REQUEST));
         }
 
-        for (EventListener listener : listeners) {
+        for (EventListener listener : env.getServletListeners()) {
             handler.addEventListener(listener);
         }
 
         for (Map.Entry<String, String> entry : config.getContextParameters().entrySet()) {
             handler.setInitParameter( entry.getKey(), entry.getValue() );
         }
-        
+
+        handler.setSessionHandler(env.getSessionHandler());
+
         handler.setConnectorNames(new String[]{"main"});
 
         return wrapHandler(handler);
